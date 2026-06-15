@@ -22,7 +22,8 @@ sending_lock = asyncio.Lock()
 promo_cancelled = False
 finding_lock = asyncio.Lock()
 chat_ended = False
-finding_timeout_task = None  # NEW: tracks the 10s timeout
+finding_timeout_task = None
+menu_shown = False  # NEW: track if menu is currently shown
 
 
 async def find_sticker():
@@ -51,7 +52,7 @@ async def find_sticker():
 
 
 async def click_find_partner():
-    global match_active, promo_sent, promo_cancelled, chat_ended, finding_timeout_task
+    global match_active, promo_sent, promo_cancelled, chat_ended, finding_timeout_task, menu_shown
 
     if finding_lock.locked():
         print("[*] Already finding partner, skipping...")
@@ -61,8 +62,8 @@ async def click_find_partner():
         print("[*] Looking for Find a Partner button...")
 
         try:
-            for attempt in range(3):
-                msgs = await client.get_messages(bot_entity, limit=10)
+            for attempt in range(5):  # Increased retries
+                msgs = await client.get_messages(bot_entity, limit=15)  # Increased limit
                 for m in msgs:
                     if not m.reply_markup:
                         continue
@@ -77,33 +78,35 @@ async def click_find_partner():
                                     promo_sent = False
                                     promo_cancelled = False
                                     chat_ended = False
+                                    menu_shown = False
                                     await asyncio.sleep(3)
                                     return True
                                 except Exception as click_err:
                                     print(f"[!] Click error: {click_err}")
                                     continue
 
-                if attempt < 2:
+                if attempt < 4:
                     print(f"[*] Button not found, waiting... (attempt {attempt+1})")
                     await asyncio.sleep(2)
 
-            print("[!] Button not found, using /search fallback")
-            await client.send_message(bot_entity, '/search')
-            match_active = False
-            promo_sent = False
-            promo_cancelled = False
-            chat_ended = False
-            await asyncio.sleep(3)
-            return True
+            # Only use /search as absolute last resort, and only if we know we're not in a chat
+            if not match_active and chat_ended:
+                print("[!] Button not found, using /search fallback")
+                await client.send_message(bot_entity, '/search')
+                match_active = False
+                promo_sent = False
+                promo_cancelled = False
+                chat_ended = False
+                menu_shown = False
+                await asyncio.sleep(3)
+                return True
+            else:
+                print("[!] Button not found, but we might be in a chat. Skipping /search fallback.")
+                return False
 
         except Exception as e:
             print(f"[!] Find partner error: {e}")
-            match_active = False
-            promo_sent = False
-            promo_cancelled = False
-            chat_ended = False
-            await asyncio.sleep(3)
-            return True
+            return False
 
 
 async def safe_stop_and_find():
@@ -190,16 +193,11 @@ async def send_promo():
 
 
 async def handle_finding_timeout():
-    """
-    Called 10 seconds after 'Finding a partner soon...' appears.
-    If no match started, send /stop and find partner again.
-    """
     global finding_timeout_task
     await asyncio.sleep(10)
 
     print("[!] Finding timeout! No match after 10 seconds.")
 
-    # Only act if we're still not in a match
     if not match_active and not finding_lock.locked():
         try:
             await client.send_message(bot_entity, '/stop')
@@ -213,9 +211,27 @@ async def handle_finding_timeout():
     finding_timeout_task = None
 
 
+# NEW: Background watchdog to recover if script gets stuck
+async def recovery_watchdog():
+    global match_active, chat_ended, menu_shown, finding_timeout_task
+    while True:
+        await asyncio.sleep(30)  # Check every 30 seconds
+
+        # If menu was shown but no action taken for 30s, try clicking again
+        if menu_shown and not match_active and not finding_lock.locked():
+            print("[!] Watchdog: Menu shown but stuck, attempting recovery...")
+            await click_find_partner()
+
+        # If we're not in a match and not finding, something is wrong
+        if not match_active and not finding_lock.locked() and not chat_ended:
+            if finding_timeout_task is None or finding_timeout_task.done():
+                print("[!] Watchdog: Idle state detected, attempting recovery...")
+                await click_find_partner()
+
+
 @client.on(events.NewMessage(chats='@Anonymouslyrobot'))
 async def handler(event):
-    global match_active, promo_sent, promo_cancelled, chat_ended, finding_timeout_task
+    global match_active, promo_sent, promo_cancelled, chat_ended, finding_timeout_task, menu_shown
 
     text = event.text or ''
 
@@ -227,9 +243,9 @@ async def handler(event):
         print("[!] Command not available in chat — we are still in a match!")
         match_active = True
         chat_ended = False
+        menu_shown = False
         promo_sent = False
 
-        # Cancel any finding timeout
         if finding_timeout_task and not finding_timeout_task.done():
             finding_timeout_task.cancel()
             try:
@@ -238,7 +254,6 @@ async def handler(event):
                 pass
             finding_timeout_task = None
 
-        # Send /stop to properly exit the chat, then find new partner
         await asyncio.sleep(1)
         try:
             await client.send_message(bot_entity, '/stop')
@@ -260,6 +275,7 @@ async def handler(event):
         match_active = False
         promo_sent = False
         chat_ended = True
+        menu_shown = False
 
         if sending_lock.locked():
             print("[!] Cancelling promo...")
@@ -280,21 +296,31 @@ async def handler(event):
         match_active = False
         promo_sent = False
         chat_ended = True
+        menu_shown = False
         await asyncio.sleep(2)
         await click_find_partner()
         return
 
     # ========== BOT WELCOME / MENU ==========
-    if "I'm an anonymous chat bot" in text:
+    if "I'm an anonymous chat bot" in text or "Use the menu or enter the" in text:
         print("[*] Bot welcome/menu shown")
+        menu_shown = True
+
         if match_active:
             print("[!] Desync detected: menu shown while match_active=True")
             match_active = False
             chat_ended = True
 
-        if not finding_lock.locked():
+        # Always try to click Find a Partner when menu appears
+        await asyncio.sleep(1)
+
+        # Retry clicking up to 3 times if locked
+        for _ in range(3):
+            if not finding_lock.locked():
+                await click_find_partner()
+                break
+            print("[*] Menu handler: finding_lock locked, waiting...")
             await asyncio.sleep(1)
-            await click_find_partner()
         return
 
     # ========== FINDING PARTNER ==========
@@ -303,8 +329,8 @@ async def handler(event):
         match_active = False
         promo_sent = False
         chat_ended = False
+        menu_shown = False
 
-        # Cancel any existing timeout
         if finding_timeout_task and not finding_timeout_task.done():
             finding_timeout_task.cancel()
             try:
@@ -312,7 +338,6 @@ async def handler(event):
             except asyncio.CancelledError:
                 pass
 
-        # Start 10-second timeout
         finding_timeout_task = asyncio.create_task(handle_finding_timeout())
         return
 
@@ -323,8 +348,8 @@ async def handler(event):
         promo_sent = False
         promo_cancelled = False
         chat_ended = False
+        menu_shown = False
 
-        # Cancel the finding timeout since we got a match
         if finding_timeout_task and not finding_timeout_task.done():
             finding_timeout_task.cancel()
             try:
@@ -370,6 +395,9 @@ async def main():
     bot_entity = await client.get_entity('@Anonymouslyrobot')
     await find_sticker()
     await click_find_partner()
+
+    # Start recovery watchdog
+    asyncio.create_task(recovery_watchdog())
 
     await client.run_until_disconnected()
 
