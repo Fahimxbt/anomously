@@ -190,11 +190,14 @@ async def end_chat_and_find():
 
 
 async def handle_finding_timeout():
+    global current_state
     await asyncio.sleep(10)
 
     async with state_lock:
-        if current_state != STATE_FINDING:
-            return
+        state = current_state
+
+    if state != STATE_FINDING:
+        return
 
     print("[!] Finding timeout! No match after 10 seconds.")
 
@@ -212,6 +215,7 @@ async def handle_finding_timeout():
 
 
 async def recovery_watchdog():
+    global current_state
     while True:
         await asyncio.sleep(30)
 
