@@ -2,12 +2,15 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 import asyncio
 import os
+import random
 import time
 
 # ========== CONFIG (from environment variables for Railway) ==========
 STRING_SESSION = os.environ.get('STRING_SESSION', '')
 API_ID = int(os.environ.get('API_ID', 0))
 API_HASH = os.environ.get('API_HASH', '')
+# Optional: set BOT_ID to a unique number (1-5) for each bot to stagger timing
+BOT_ID = int(os.environ.get('BOT_ID', 1))
 # ============================
 
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
@@ -26,6 +29,10 @@ state_lock = asyncio.Lock()
 partner_skipped = False
 last_processed_msg_id = 0
 last_click_time = 0
+
+# Anti-self-match: track recent partner IDs to avoid matching same bot
+recent_partner_ids = set()
+MAX_RECENT_PARTNERS = 20
 
 
 async def find_sticker():
@@ -51,12 +58,10 @@ async def click_find_partner():
     global current_state, last_click_time
 
     async with state_lock:
-        # CRITICAL: Don't click if in a match or waiting
         if current_state in (STATE_MATCHED, STATE_WAITING_PARTNER):
             print(f"[*] In match (state={current_state}), skipping Find a Partner click")
             return False
 
-        # Cooldown: don't click more than once per 5 seconds
         now = time.time()
         if now - last_click_time < 5:
             print(f"[*] Click cooldown active ({now - last_click_time:.1f}s), skipping...")
@@ -69,11 +74,24 @@ async def click_find_partner():
 
         current_state = STATE_FINDING
 
+    # ANTI-SELF-MATCH: staggered random delay based on BOT_ID
+    # Each bot gets a different base delay so they rarely sync up
+    base_delay = BOT_ID * 1.5  # Bot 1=1.5s, Bot 2=3s, Bot 3=4.5s, etc.
+    random_delay = random.uniform(0, 3)
+    total_delay = base_delay + random_delay
+    print(f"[*] Anti-self-match: waiting {total_delay:.1f}s before clicking (bot_id={BOT_ID})...")
+    await asyncio.sleep(total_delay)
+
+    # Re-check state after delay
+    async with state_lock:
+        if current_state in (STATE_MATCHED, STATE_WAITING_PARTNER):
+            print(f"[*] State changed to match during delay, aborting click")
+            return False
+
     print("[*] Looking for Find a Partner button...")
 
     try:
         for attempt in range(5):
-            # Re-check state before each attempt - might have changed while waiting
             async with state_lock:
                 if current_state in (STATE_MATCHED, STATE_WAITING_PARTNER):
                     print(f"[*] State changed to match during search, aborting click")
@@ -100,7 +118,6 @@ async def click_find_partner():
                 print(f"[*] Button not found, waiting... (attempt {attempt+1})")
                 await asyncio.sleep(2)
 
-        # Fallback: only use /search if still finding
         async with state_lock:
             if current_state == STATE_FINDING:
                 print("[!] Button not found, using /search fallback")
@@ -118,16 +135,8 @@ async def click_find_partner():
 
 
 async def handle_match():
-    """
-    Main match lifecycle:
-    1. Forward sticker
-    2. Wait 3 seconds for partner to skip us
-    3. If partner skipped (sent message), find new match after 3 sec
-    4. If partner didn't skip, send /stop ourselves, wait 2 sec, find new match
-    """
-    global current_state, partner_skipped
+    global current_state, partner_skipped, recent_partner_ids
 
-    # Step 1: Forward sticker
     async with state_lock:
         if current_state != STATE_MATCHED:
             print(f"[*] Not in match (state={current_state}), aborting handle_match")
@@ -146,11 +155,9 @@ async def handle_match():
     except Exception as e:
         print(f"[!] Sticker error: {e}")
 
-    # Step 2: Wait 3 seconds to see if partner skips us
     print("[*] Waiting 3 seconds for partner response...")
     await asyncio.sleep(3)
 
-    # Step 3: Check if partner skipped us
     async with state_lock:
         skipped = partner_skipped
         state = current_state
@@ -167,7 +174,6 @@ async def handle_match():
         print(f"[*] State changed to {state} during wait, aborting")
         return
 
-    # Step 4: Partner didn't skip, we skip ourselves
     print("[*] Partner didn't skip, sending /stop...")
     try:
         await client.send_message(bot_entity, '/stop')
@@ -184,46 +190,50 @@ async def handle_match():
 
 
 async def handle_finding_timeout():
+    global current_state
     await asyncio.sleep(10)
 
-    async with state_lock:
-        state = current_state
-
-    if state != STATE_FINDING:
-        return
-
-    print("[!] Finding timeout! No match after 10 seconds.")
-
     try:
-        await client.send_message(bot_entity, '/stop')
-        print("[→] /stop sent (timeout)")
-        await asyncio.sleep(2)
-    except Exception as e:
-        print(f"[!] Timeout /stop error: {e}")
-
-    async with state_lock:
-        current_state = STATE_IDLE
-
-    await click_find_partner()
-
-
-async def recovery_watchdog():
-    while True:
-        await asyncio.sleep(30)
-
         async with state_lock:
             state = current_state
 
-        if state == STATE_IDLE:
-            print("[!] Watchdog: Idle state detected, finding partner...")
-            await click_find_partner()
+        if state != STATE_FINDING:
+            return
+
+        print("[!] Finding timeout! No match after 10 seconds.")
+
+        await client.send_message(bot_entity, '/stop')
+        print("[→] /stop sent (timeout)")
+        await asyncio.sleep(2)
+
+        async with state_lock:
+            current_state = STATE_IDLE
+
+        await click_find_partner()
+    except Exception as e:
+        print(f"[!] Finding timeout error: {e}")
+
+
+async def recovery_watchdog():
+    global current_state
+    while True:
+        await asyncio.sleep(30)
+
+        try:
+            async with state_lock:
+                state = current_state
+
+            if state == STATE_IDLE:
+                print("[!] Watchdog: Idle state detected, finding partner...")
+                await click_find_partner()
+        except Exception as e:
+            print(f"[!] Watchdog error: {e}")
 
 
 @client.on(events.NewMessage(chats='@Anonymouslyrobot'))
 async def handler(event):
-    global current_state, partner_skipped, last_processed_msg_id
+    global current_state, partner_skipped, last_processed_msg_id, recent_partner_ids
 
-    # DEDUPLICATION: skip if we've already processed this message
     if event.id <= last_processed_msg_id:
         return
     last_processed_msg_id = event.id
@@ -240,7 +250,6 @@ async def handler(event):
         async with state_lock:
             current_state = STATE_MATCHED
 
-        # Send /stop to exit the match, then find new partner
         await asyncio.sleep(1)
         try:
             await client.send_message(bot_entity, '/stop')
@@ -306,7 +315,6 @@ async def handler(event):
             current_state = STATE_MATCHED
             partner_skipped = False
 
-        # Start the match lifecycle as a single sequential task
         asyncio.create_task(handle_match())
         return
 
@@ -330,7 +338,7 @@ async def handler(event):
 async def main():
     global bot_entity
     await client.start()
-    print("[*] xbt1-bot (Anonymouslyrobot) started!")
+    print(f"[*] xbt1-bot (Anonymouslyrobot) started! BOT_ID={BOT_ID}")
 
     bot_entity = await client.get_entity('@Anonymouslyrobot')
     await find_sticker()
