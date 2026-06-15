@@ -13,8 +13,6 @@ client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
 bot_entity = None
 sticker_msg_id = None
-heyyy_msg_id = None
-f_msg_id = None
 
 # State machine
 STATE_IDLE = 'idle'
@@ -27,36 +25,29 @@ current_state = STATE_IDLE
 promo_cancelled = False
 state_lock = asyncio.Lock()
 active_promo_task = None
-active_click_task = None  # Track click_find_partner task
+active_click_task = None
 
 
 async def find_sticker():
-    global sticker_msg_id, heyyy_msg_id, f_msg_id
+    global sticker_msg_id
     try:
         msgs = await client.get_messages('me', limit=50)
         for m in msgs:
             if m.sticker and not sticker_msg_id:
                 sticker_msg_id = m.id
                 print("[+] Sticker found!")
-            if m.text and m.text.lower() == 'heyyy' and not heyyy_msg_id:
-                heyyy_msg_id = m.id
-                print("[+] 'heyyy' message found!")
-            if m.text and m.text.upper() == 'F' and not f_msg_id:
-                f_msg_id = m.id
-                print("[+] 'F' message found!")
 
-        if all([sticker_msg_id, heyyy_msg_id, f_msg_id]):
+        if sticker_msg_id:
             return True
 
     except Exception as e:
         print(f"[!] Find error: {e}")
 
-    print("[!] Send 'heyyy', 'F', and sticker to Saved Messages first!")
+    print("[!] Send a sticker to Saved Messages first!")
     return False
 
 
 async def _do_click_find_partner():
-    """Internal: actually performs the click/find logic."""
     global current_state
 
     print("[*] Looking for Find a Partner button...")
@@ -98,15 +89,12 @@ async def _do_click_find_partner():
 
 
 async def click_find_partner():
-    """Wrapper that ensures only ONE click_find_partner runs at a time."""
     global current_state, active_click_task
 
     async with state_lock:
-        # If already finding or clicking, don't start another
         if current_state == STATE_FINDING:
             print("[*] Already finding partner, skipping...")
             return
-        # If a click task is already running, cancel it first
         if active_click_task and not active_click_task.done():
             print("[*] Cancelling previous click task...")
             active_click_task.cancel()
@@ -128,56 +116,28 @@ async def click_find_partner():
 
 
 async def _check_state(expected_state):
-    """Check if we're still in expected state, return True if ok, False if cancelled."""
     async with state_lock:
         if promo_cancelled or current_state != expected_state:
             return False
     return True
 
 
-async def send_promo_sequence():
+async def send_sticker_only():
     global current_state, promo_cancelled, active_promo_task
 
     async with state_lock:
         if current_state != STATE_MATCHED:
-            print(f"[*] Not in match (state={current_state}), skipping promo")
+            print(f"[*] Not in match (state={current_state}), skipping sticker")
             active_promo_task = None
             return
         current_state = STATE_SENDING_PROMO
         promo_cancelled = False
 
-    print("[*] Starting promo sequence...")
+    print("[*] Forwarding sticker...")
 
     try:
-        # Step 1: heyyy
         if not await _check_state(STATE_SENDING_PROMO):
-            print("[!] Promo cancelled before heyyy")
-            active_promo_task = None
-            return
-
-        if heyyy_msg_id:
-            await client.forward_messages(bot_entity, heyyy_msg_id, 'me')
-        else:
-            await client.send_message(bot_entity, "heyyy")
-        print("[+] Sent: heyyy")
-        await asyncio.sleep(3)
-
-        # Step 2: F
-        if not await _check_state(STATE_SENDING_PROMO):
-            print("[!] Promo cancelled before F")
-            active_promo_task = None
-            return
-
-        if f_msg_id:
-            await client.forward_messages(bot_entity, f_msg_id, 'me')
-        else:
-            await client.send_message(bot_entity, "F")
-        print("[+] Sent: F")
-        await asyncio.sleep(3)
-
-        # Step 3: Sticker
-        if not await _check_state(STATE_SENDING_PROMO):
-            print("[!] Promo cancelled before sticker")
+            print("[!] Sticker send cancelled")
             active_promo_task = None
             return
 
@@ -190,9 +150,8 @@ async def send_promo_sequence():
         await asyncio.sleep(2)
 
     except Exception as e:
-        print(f"[!] Promo error: {e}")
+        print(f"[!] Sticker error: {e}")
 
-    # After promo, end the chat and find next
     should_end = False
     async with state_lock:
         if current_state == STATE_SENDING_PROMO and not promo_cancelled:
@@ -390,7 +349,7 @@ async def handler(event):
             promo_cancelled = False
 
         await asyncio.sleep(1)
-        active_promo_task = asyncio.create_task(send_promo_sequence())
+        active_promo_task = asyncio.create_task(send_sticker_only())
         return
 
     # ========== PARTNER SENT MESSAGE DURING MATCH ==========
@@ -399,7 +358,7 @@ async def handler(event):
 
     if state == STATE_MATCHED:
         print("[+] Partner sent message/sticker during match!")
-        active_promo_task = asyncio.create_task(send_promo_sequence())
+        active_promo_task = asyncio.create_task(send_sticker_only())
         return
 
 
