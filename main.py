@@ -14,18 +14,15 @@ client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 bot_entity = None
 sticker_msg_id = None
 
-# State machine
+# State machine - simplified
 STATE_IDLE = 'idle'
 STATE_FINDING = 'finding'
 STATE_MATCHED = 'matched'
-STATE_SENDING_PROMO = 'sending_promo'
-STATE_ENDING = 'ending'
+STATE_WAITING_PARTNER = 'waiting_partner'  # After sending sticker, waiting to see if partner skips
 
 current_state = STATE_IDLE
-promo_cancelled = False
 state_lock = asyncio.Lock()
-active_promo_task = None
-active_click_task = None
+partner_skipped = False  # Set when partner sends message after our sticker
 
 
 async def find_sticker():
@@ -47,8 +44,14 @@ async def find_sticker():
     return False
 
 
-async def _do_click_find_partner():
+async def click_find_partner():
     global current_state
+
+    async with state_lock:
+        if current_state == STATE_FINDING:
+            print("[*] Already finding partner, skipping...")
+            return
+        current_state = STATE_FINDING
 
     print("[*] Looking for Find a Partner button...")
 
@@ -88,98 +91,65 @@ async def _do_click_find_partner():
                 current_state = STATE_IDLE
 
 
-async def click_find_partner():
-    global current_state, active_click_task
+async def handle_match():
+    """
+    Main match lifecycle:
+    1. Forward sticker
+    2. Wait 3 seconds for partner to skip us
+    3. If partner skipped (sent message), find new match after 3 sec
+    4. If partner didn't skip, send /stop ourselves, wait 2 sec, find new match
+    """
+    global current_state, partner_skipped
 
-    async with state_lock:
-        if current_state == STATE_FINDING:
-            print("[*] Already finding partner, skipping...")
-            return
-        if active_click_task and not active_click_task.done():
-            print("[*] Cancelling previous click task...")
-            active_click_task.cancel()
-            try:
-                await active_click_task
-            except asyncio.CancelledError:
-                pass
-
-        current_state = STATE_FINDING
-        active_click_task = asyncio.create_task(_do_click_find_partner())
-
-    try:
-        await active_click_task
-    except asyncio.CancelledError:
-        print("[*] Click task was cancelled")
-    finally:
-        async with state_lock:
-            active_click_task = None
-
-
-async def _check_state(expected_state):
-    async with state_lock:
-        if promo_cancelled or current_state != expected_state:
-            return False
-    return True
-
-
-async def send_sticker_only():
-    global current_state, promo_cancelled, active_promo_task
-
+    # Step 1: Forward sticker
     async with state_lock:
         if current_state != STATE_MATCHED:
-            print(f"[*] Not in match (state={current_state}), skipping sticker")
-            active_promo_task = None
+            print(f"[*] Not in match (state={current_state}), aborting handle_match")
             return
-        current_state = STATE_SENDING_PROMO
-        promo_cancelled = False
+        current_state = STATE_WAITING_PARTNER
+        partner_skipped = False
 
     print("[*] Forwarding sticker...")
-
     try:
-        if not await _check_state(STATE_SENDING_PROMO):
-            print("[!] Sticker send cancelled")
-            active_promo_task = None
-            return
-
         if sticker_msg_id:
             await client.forward_messages(bot_entity, sticker_msg_id, 'me')
             print("[+] Sticker forwarded!")
         else:
             await client.send_message(bot_entity, "💜 @chatxbt_bot\nhttps://t.me/chatxbt_bot")
             print("[+] Text promo sent!")
-        await asyncio.sleep(2)
-
     except Exception as e:
         print(f"[!] Sticker error: {e}")
 
-    should_end = False
+    # Step 2: Wait 3 seconds to see if partner skips us
+    print("[*] Waiting 3 seconds for partner response...")
+    await asyncio.sleep(3)
+
+    # Step 3: Check if partner skipped us
     async with state_lock:
-        if current_state == STATE_SENDING_PROMO and not promo_cancelled:
-            current_state = STATE_ENDING
-            should_end = True
+        skipped = partner_skipped
+        state = current_state
 
-    active_promo_task = None
+    if skipped:
+        print("[✓] Partner skipped us (sent message), finding new match in 3 seconds...")
+        await asyncio.sleep(3)
+        async with state_lock:
+            current_state = STATE_IDLE
+        await click_find_partner()
+        return
 
-    if should_end and not promo_cancelled:
-        await end_chat_and_find()
+    if state != STATE_WAITING_PARTNER:
+        print(f"[*] State changed to {state} during wait, aborting")
+        return
 
-
-async def end_chat_and_find():
-    global current_state
-
-    async with state_lock:
-        if current_state == STATE_IDLE or current_state == STATE_FINDING:
-            print("[*] Not in a chat, skipping /stop")
-            await click_find_partner()
-            return
-        current_state = STATE_ENDING
-
+    # Step 4: Partner didn't skip, we skip ourselves
+    print("[*] Partner didn't skip, sending /stop...")
     try:
         await client.send_message(bot_entity, '/stop')
         print("[→] /stop sent")
-        await asyncio.sleep(3)
     except Exception as e:
         print(f"[!] Stop error: {e}")
+
+    await asyncio.sleep(2)
 
     async with state_lock:
         current_state = STATE_IDLE
@@ -187,41 +157,7 @@ async def end_chat_and_find():
     await click_find_partner()
 
 
-async def cancel_active_promo():
-    global active_promo_task, promo_cancelled
-
-    async with state_lock:
-        promo_cancelled = True
-        task = active_promo_task
-
-    if task and not task.done():
-        print("[!] Cancelling active promo task...")
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        print("[✓] Promo task cancelled")
-
-
-async def cancel_active_click():
-    global active_click_task
-
-    async with state_lock:
-        task = active_click_task
-
-    if task and not task.done():
-        print("[!] Cancelling active click task...")
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        print("[✓] Click task cancelled")
-
-
 async def handle_finding_timeout():
-    global current_state
     await asyncio.sleep(10)
 
     async with state_lock:
@@ -246,49 +182,29 @@ async def handle_finding_timeout():
 
 
 async def recovery_watchdog():
-    global current_state
     while True:
         await asyncio.sleep(30)
 
         async with state_lock:
             state = current_state
-            has_click_task = active_click_task is not None and not active_click_task.done()
-            has_promo_task = active_promo_task is not None and not active_promo_task.done()
 
-        if state == STATE_IDLE and not has_click_task and not has_promo_task:
+        if state == STATE_IDLE:
             print("[!] Watchdog: Idle state detected, finding partner...")
             await click_find_partner()
 
 
 @client.on(events.NewMessage(chats='@Anonymouslyrobot'))
 async def handler(event):
-    global current_state, promo_cancelled, active_promo_task
+    global current_state, partner_skipped
 
     text = event.text or ''
 
     if event.out:
         return
 
-    # ========== COMMAND NOT AVAILABLE IN CHAT ==========
-    if 'This command is not available in chat' in text:
-        print("[!] Command not available in chat — we are still in a match!")
-
-        await cancel_active_promo()
-        await cancel_active_click()
-
-        async with state_lock:
-            current_state = STATE_MATCHED
-
-        await asyncio.sleep(1)
-        await end_chat_and_find()
-        return
-
     # ========== PARTNER ENDED CHAT ==========
     if 'Your partner ended the chat' in text:
         print("[✓] Partner ended chat")
-
-        await cancel_active_promo()
-        await cancel_active_click()
 
         async with state_lock:
             current_state = STATE_IDLE
@@ -301,9 +217,6 @@ async def handler(event):
     if 'You left the chat' in text:
         print("[✓] We left the chat")
 
-        await cancel_active_promo()
-        await cancel_active_click()
-
         async with state_lock:
             current_state = STATE_IDLE
 
@@ -315,12 +228,7 @@ async def handler(event):
     if "I'm an anonymous chat bot" in text or "Use the menu or enter the" in text:
         print("[*] Bot welcome/menu shown")
 
-        await cancel_active_promo()
-        await cancel_active_click()
-
         async with state_lock:
-            if current_state == STATE_MATCHED or current_state == STATE_SENDING_PROMO:
-                print("[!] Desync detected: menu shown while in match")
             current_state = STATE_IDLE
 
         await asyncio.sleep(1)
@@ -341,24 +249,28 @@ async def handler(event):
     if 'Start chatting' in text:
         print("[+] Match started!")
 
-        await cancel_active_promo()
-        await cancel_active_click()
-
         async with state_lock:
             current_state = STATE_MATCHED
-            promo_cancelled = False
+            partner_skipped = False
 
-        await asyncio.sleep(1)
-        active_promo_task = asyncio.create_task(send_sticker_only())
+        # Start the match lifecycle as a single sequential task
+        asyncio.create_task(handle_match())
         return
 
     # ========== PARTNER SENT MESSAGE DURING MATCH ==========
     async with state_lock:
         state = current_state
 
+    if state == STATE_WAITING_PARTNER:
+        print("[+] Partner sent message/sticker — they skipped us!")
+        async with state_lock:
+            partner_skipped = True
+        return
+
     if state == STATE_MATCHED:
-        print("[+] Partner sent message/sticker during match!")
-        active_promo_task = asyncio.create_task(send_sticker_only())
+        print("[+] Partner sent message before our sticker!")
+        async with state_lock:
+            partner_skipped = True
         return
 
 
