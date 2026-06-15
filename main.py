@@ -26,6 +26,7 @@ STATE_ENDING = 'ending'
 current_state = STATE_IDLE
 promo_cancelled = False
 state_lock = asyncio.Lock()
+active_promo_task = None  # Track the current promo task so we can cancel it
 
 
 async def find_sticker():
@@ -87,7 +88,6 @@ async def click_find_partner():
                 print(f"[*] Button not found, waiting... (attempt {attempt+1})")
                 await asyncio.sleep(2)
 
-        # Fallback: only use /search if we're truly idle (not in a chat)
         async with state_lock:
             if current_state == STATE_FINDING:
                 print("[!] Button not found, using /search fallback")
@@ -101,12 +101,21 @@ async def click_find_partner():
                 current_state = STATE_IDLE
 
 
+async def _check_state(expected_state):
+    """Check if we're still in expected state, return True if ok, False if cancelled."""
+    async with state_lock:
+        if promo_cancelled or current_state != expected_state:
+            return False
+    return True
+
+
 async def send_promo_sequence():
-    global current_state, promo_cancelled
+    global current_state, promo_cancelled, active_promo_task
 
     async with state_lock:
         if current_state != STATE_MATCHED:
             print(f"[*] Not in match (state={current_state}), skipping promo")
+            active_promo_task = None
             return
         current_state = STATE_SENDING_PROMO
         promo_cancelled = False
@@ -115,10 +124,10 @@ async def send_promo_sequence():
 
     try:
         # Step 1: heyyy
-        async with state_lock:
-            if promo_cancelled or current_state != STATE_SENDING_PROMO:
-                print("[!] Promo cancelled before heyyy")
-                return
+        if not await _check_state(STATE_SENDING_PROMO):
+            print("[!] Promo cancelled before heyyy")
+            active_promo_task = None
+            return
 
         if heyyy_msg_id:
             await client.forward_messages(bot_entity, heyyy_msg_id, 'me')
@@ -128,10 +137,10 @@ async def send_promo_sequence():
         await asyncio.sleep(3)
 
         # Step 2: F
-        async with state_lock:
-            if promo_cancelled or current_state != STATE_SENDING_PROMO:
-                print("[!] Promo cancelled before F")
-                return
+        if not await _check_state(STATE_SENDING_PROMO):
+            print("[!] Promo cancelled before F")
+            active_promo_task = None
+            return
 
         if f_msg_id:
             await client.forward_messages(bot_entity, f_msg_id, 'me')
@@ -141,10 +150,10 @@ async def send_promo_sequence():
         await asyncio.sleep(3)
 
         # Step 3: Sticker
-        async with state_lock:
-            if promo_cancelled or current_state != STATE_SENDING_PROMO:
-                print("[!] Promo cancelled before sticker")
-                return
+        if not await _check_state(STATE_SENDING_PROMO):
+            print("[!] Promo cancelled before sticker")
+            active_promo_task = None
+            return
 
         if sticker_msg_id:
             await client.forward_messages(bot_entity, sticker_msg_id, 'me')
@@ -158,11 +167,15 @@ async def send_promo_sequence():
         print(f"[!] Promo error: {e}")
 
     # After promo, end the chat and find next
+    should_end = False
     async with state_lock:
         if current_state == STATE_SENDING_PROMO and not promo_cancelled:
             current_state = STATE_ENDING
+            should_end = True
 
-    if not promo_cancelled:
+    active_promo_task = None
+
+    if should_end and not promo_cancelled:
         await end_chat_and_find()
 
 
@@ -187,6 +200,23 @@ async def end_chat_and_find():
         current_state = STATE_IDLE
 
     await click_find_partner()
+
+
+async def cancel_active_promo():
+    global active_promo_task, promo_cancelled
+
+    async with state_lock:
+        promo_cancelled = True
+        task = active_promo_task
+
+    if task and not task.done():
+        print("[!] Cancelling active promo task...")
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        print("[✓] Promo task cancelled")
 
 
 async def handle_finding_timeout():
@@ -229,7 +259,7 @@ async def recovery_watchdog():
 
 @client.on(events.NewMessage(chats='@Anonymouslyrobot'))
 async def handler(event):
-    global current_state, promo_cancelled
+    global current_state, promo_cancelled, active_promo_task
 
     text = event.text or ''
 
@@ -239,6 +269,8 @@ async def handler(event):
     # ========== COMMAND NOT AVAILABLE IN CHAT ==========
     if 'This command is not available in chat' in text:
         print("[!] Command not available in chat — we are still in a match!")
+
+        await cancel_active_promo()
 
         async with state_lock:
             current_state = STATE_MATCHED
@@ -251,8 +283,9 @@ async def handler(event):
     if 'Your partner ended the chat' in text:
         print("[✓] Partner ended chat")
 
+        await cancel_active_promo()
+
         async with state_lock:
-            promo_cancelled = True
             current_state = STATE_IDLE
 
         await asyncio.sleep(2)
@@ -263,8 +296,9 @@ async def handler(event):
     if 'You left the chat' in text:
         print("[✓] We left the chat")
 
+        await cancel_active_promo()
+
         async with state_lock:
-            promo_cancelled = True
             current_state = STATE_IDLE
 
         await asyncio.sleep(2)
@@ -274,6 +308,8 @@ async def handler(event):
     # ========== BOT WELCOME / MENU ==========
     if "I'm an anonymous chat bot" in text or "Use the menu or enter the" in text:
         print("[*] Bot welcome/menu shown")
+
+        await cancel_active_promo()
 
         async with state_lock:
             if current_state == STATE_MATCHED or current_state == STATE_SENDING_PROMO:
@@ -298,12 +334,14 @@ async def handler(event):
     if 'Start chatting' in text:
         print("[+] Match started!")
 
+        await cancel_active_promo()
+
         async with state_lock:
             current_state = STATE_MATCHED
             promo_cancelled = False
 
         await asyncio.sleep(1)
-        await send_promo_sequence()
+        active_promo_task = asyncio.create_task(send_promo_sequence())
         return
 
     # ========== PARTNER SENT MESSAGE DURING MATCH ==========
@@ -312,7 +350,7 @@ async def handler(event):
 
     if state == STATE_MATCHED:
         print("[+] Partner sent message/sticker during match!")
-        await send_promo_sequence()
+        active_promo_task = asyncio.create_task(send_promo_sequence())
         return
 
 
@@ -325,7 +363,6 @@ async def main():
     await find_sticker()
     await click_find_partner()
 
-    # Start recovery watchdog
     asyncio.create_task(recovery_watchdog())
 
     await client.run_until_disconnected()
