@@ -2,6 +2,7 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 import asyncio
 import os
+import time
 
 # ========== CONFIG (from environment variables for Railway) ==========
 STRING_SESSION = os.environ.get('STRING_SESSION', '')
@@ -14,15 +15,18 @@ client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 bot_entity = None
 sticker_msg_id = None
 
-# State machine - simplified
+# State machine
 STATE_IDLE = 'idle'
 STATE_FINDING = 'finding'
 STATE_MATCHED = 'matched'
-STATE_WAITING_PARTNER = 'waiting_partner'  # After sending sticker, waiting to see if partner skips
+STATE_WAITING_PARTNER = 'waiting_partner'
 
 current_state = STATE_IDLE
 state_lock = asyncio.Lock()
-partner_skipped = False  # Set when partner sends message after our sticker
+partner_skipped = False
+active_match_task = None
+last_processed_msg_id = 0
+last_click_time = 0  # NEW: cooldown tracking
 
 
 async def find_sticker():
@@ -45,9 +49,21 @@ async def find_sticker():
 
 
 async def click_find_partner():
-    global current_state
+    global current_state, last_click_time
 
     async with state_lock:
+        # Don't click if in a match
+        if current_state in (STATE_MATCHED, STATE_WAITING_PARTNER):
+            print(f"[*] In match (state={current_state}), skipping Find a Partner click")
+            return
+
+        # Cooldown: don't click more than once per 5 seconds
+        now = time.time()
+        if now - last_click_time < 5:
+            print(f"[*] Click cooldown active ({now - last_click_time:.1f}s), skipping...")
+            return
+        last_click_time = now
+
         if current_state == STATE_FINDING:
             print("[*] Already finding partner, skipping...")
             return
@@ -99,12 +115,13 @@ async def handle_match():
     3. If partner skipped (sent message), find new match after 3 sec
     4. If partner didn't skip, send /stop ourselves, wait 2 sec, find new match
     """
-    global current_state, partner_skipped
+    global current_state, partner_skipped, active_match_task
 
     # Step 1: Forward sticker
     async with state_lock:
         if current_state != STATE_MATCHED:
             print(f"[*] Not in match (state={current_state}), aborting handle_match")
+            active_match_task = None
             return
         current_state = STATE_WAITING_PARTNER
         partner_skipped = False
@@ -134,11 +151,14 @@ async def handle_match():
         await asyncio.sleep(3)
         async with state_lock:
             current_state = STATE_IDLE
+            active_match_task = None
         await click_find_partner()
         return
 
     if state != STATE_WAITING_PARTNER:
         print(f"[*] State changed to {state} during wait, aborting")
+        async with state_lock:
+            active_match_task = None
         return
 
     # Step 4: Partner didn't skip, we skip ourselves
@@ -153,6 +173,7 @@ async def handle_match():
 
     async with state_lock:
         current_state = STATE_IDLE
+        active_match_task = None
 
     await click_find_partner()
 
@@ -187,15 +208,21 @@ async def recovery_watchdog():
 
         async with state_lock:
             state = current_state
+            has_match_task = active_match_task is not None and not active_match_task.done()
 
-        if state == STATE_IDLE:
+        if state == STATE_IDLE and not has_match_task:
             print("[!] Watchdog: Idle state detected, finding partner...")
             await click_find_partner()
 
 
 @client.on(events.NewMessage(chats='@Anonymouslyrobot'))
 async def handler(event):
-    global current_state, partner_skipped
+    global current_state, partner_skipped, active_match_task, last_processed_msg_id
+
+    # DEDUPLICATION: skip if we've already processed this message
+    if event.id <= last_processed_msg_id:
+        return
+    last_processed_msg_id = event.id
 
     text = event.text or ''
 
@@ -250,11 +277,20 @@ async def handler(event):
         print("[+] Match started!")
 
         async with state_lock:
+            # Cancel any existing match task before starting new one
+            if active_match_task and not active_match_task.done():
+                print("[!] Cancelling existing match task...")
+                active_match_task.cancel()
+                try:
+                    await active_match_task
+                except asyncio.CancelledError:
+                    pass
+                print("[✓] Old match task cancelled")
+
             current_state = STATE_MATCHED
             partner_skipped = False
+            active_match_task = asyncio.create_task(handle_match())
 
-        # Start the match lifecycle as a single sequential task
-        asyncio.create_task(handle_match())
         return
 
     # ========== PARTNER SENT MESSAGE DURING MATCH ==========
