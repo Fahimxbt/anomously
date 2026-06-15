@@ -26,7 +26,8 @@ STATE_ENDING = 'ending'
 current_state = STATE_IDLE
 promo_cancelled = False
 state_lock = asyncio.Lock()
-active_promo_task = None  # Track the current promo task so we can cancel it
+active_promo_task = None
+active_click_task = None  # Track click_find_partner task
 
 
 async def find_sticker():
@@ -54,14 +55,9 @@ async def find_sticker():
     return False
 
 
-async def click_find_partner():
+async def _do_click_find_partner():
+    """Internal: actually performs the click/find logic."""
     global current_state
-
-    async with state_lock:
-        if current_state == STATE_FINDING:
-            print("[*] Already finding partner, skipping...")
-            return
-        current_state = STATE_FINDING
 
     print("[*] Looking for Find a Partner button...")
 
@@ -99,6 +95,36 @@ async def click_find_partner():
         async with state_lock:
             if current_state == STATE_FINDING:
                 current_state = STATE_IDLE
+
+
+async def click_find_partner():
+    """Wrapper that ensures only ONE click_find_partner runs at a time."""
+    global current_state, active_click_task
+
+    async with state_lock:
+        # If already finding or clicking, don't start another
+        if current_state == STATE_FINDING:
+            print("[*] Already finding partner, skipping...")
+            return
+        # If a click task is already running, cancel it first
+        if active_click_task and not active_click_task.done():
+            print("[*] Cancelling previous click task...")
+            active_click_task.cancel()
+            try:
+                await active_click_task
+            except asyncio.CancelledError:
+                pass
+
+        current_state = STATE_FINDING
+        active_click_task = asyncio.create_task(_do_click_find_partner())
+
+    try:
+        await active_click_task
+    except asyncio.CancelledError:
+        print("[*] Click task was cancelled")
+    finally:
+        async with state_lock:
+            active_click_task = None
 
 
 async def _check_state(expected_state):
@@ -219,6 +245,22 @@ async def cancel_active_promo():
         print("[✓] Promo task cancelled")
 
 
+async def cancel_active_click():
+    global active_click_task
+
+    async with state_lock:
+        task = active_click_task
+
+    if task and not task.done():
+        print("[!] Cancelling active click task...")
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        print("[✓] Click task cancelled")
+
+
 async def handle_finding_timeout():
     global current_state
     await asyncio.sleep(10)
@@ -251,8 +293,10 @@ async def recovery_watchdog():
 
         async with state_lock:
             state = current_state
+            has_click_task = active_click_task is not None and not active_click_task.done()
+            has_promo_task = active_promo_task is not None and not active_promo_task.done()
 
-        if state == STATE_IDLE:
+        if state == STATE_IDLE and not has_click_task and not has_promo_task:
             print("[!] Watchdog: Idle state detected, finding partner...")
             await click_find_partner()
 
@@ -271,6 +315,7 @@ async def handler(event):
         print("[!] Command not available in chat — we are still in a match!")
 
         await cancel_active_promo()
+        await cancel_active_click()
 
         async with state_lock:
             current_state = STATE_MATCHED
@@ -284,6 +329,7 @@ async def handler(event):
         print("[✓] Partner ended chat")
 
         await cancel_active_promo()
+        await cancel_active_click()
 
         async with state_lock:
             current_state = STATE_IDLE
@@ -297,6 +343,7 @@ async def handler(event):
         print("[✓] We left the chat")
 
         await cancel_active_promo()
+        await cancel_active_click()
 
         async with state_lock:
             current_state = STATE_IDLE
@@ -310,6 +357,7 @@ async def handler(event):
         print("[*] Bot welcome/menu shown")
 
         await cancel_active_promo()
+        await cancel_active_click()
 
         async with state_lock:
             if current_state == STATE_MATCHED or current_state == STATE_SENDING_PROMO:
@@ -335,6 +383,7 @@ async def handler(event):
         print("[+] Match started!")
 
         await cancel_active_promo()
+        await cancel_active_click()
 
         async with state_lock:
             current_state = STATE_MATCHED
