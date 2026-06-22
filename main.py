@@ -35,7 +35,7 @@ last_cmd_time = 0
 FINDING_TIMEOUT = 20
 MATCH_STUCK_TIMEOUT = 60
 RECOVERY_INTERVAL = 60
-CMD_COOLDOWN = 3  # Seconds between commands
+CMD_COOLDOWN = 3
 
 
 async def safe_send_message(entity, message, retries=3):
@@ -99,8 +99,8 @@ async def find_sticker():
     return False
 
 
-async def click_any_button(keywords, limit=15):
-    """Click any button matching keywords. Returns True if clicked."""
+async def click_button_by_keywords(keywords, limit=15):
+    """Click first button matching any keyword. Returns (clicked, btn_text)."""
     try:
         msgs = await client.get_messages(bot_entity, limit=limit)
         for m in msgs:
@@ -115,41 +115,48 @@ async def click_any_button(keywords, limit=15):
                                 await m.click(text=btn.text)
                                 print(f"[→] Clicked: {btn.text}")
                                 await asyncio.sleep(2)
-                                return True
+                                return True, btn.text
                             except Exception as e:
                                 print(f"[!] Click error: {e}")
                                 continue
     except Exception as e:
         print(f"[!] Button search error: {e}")
-    return False
+    return False, None
 
 
-async def force_reset_state():
-    """Force reset bot state when stuck. Try buttons first, then commands."""
+async def end_chat_and_find_new():
+    """Properly end current chat, then find new partner."""
     global current_state, last_cmd_time
 
-    print("[!] FORCE RESET: Attempting to recover from stuck state...")
+    print("[*] Ending chat and finding new partner...")
 
-    # Try clicking Stop/End Chat button first
-    if await click_any_button(['stop', 'end chat', 'end'], limit=10):
+    # Step 1: Try to click Stop/End Chat button
+    clicked, btn = await click_button_by_keywords(['stop', 'end chat', 'end'], limit=10)
+    if clicked:
+        print(f"[→] Ended chat via button: {btn}")
         await asyncio.sleep(3)
 
-    # Try clicking Find a Partner / Next button
-    if await click_any_button(['find', 'next', 'find a partner'], limit=10):
-        await asyncio.sleep(3)
+    # Step 2: Try clicking Find a Partner / Next button
+    clicked, btn = await click_button_by_keywords(['find a partner', 'find partner', 'next'], limit=10)
+    if clicked:
+        print(f"[→] Found new partner via button: {btn}")
         async with state_lock:
             current_state = STATE_FINDING
+        await asyncio.sleep(3)
         return True
 
-    # Fallback: send /stop then /next with cooldown
+    # Step 3: Fallback - send /stop then wait
     now = time.time()
     if now - last_cmd_time >= CMD_COOLDOWN:
+        print("[→] Sending /stop (fallback)")
         await safe_send_message(bot_entity, '/stop')
         last_cmd_time = time.time()
         await asyncio.sleep(4)
 
+    # Step 4: Fallback - send /next
     now = time.time()
     if now - last_cmd_time >= CMD_COOLDOWN:
+        print("[→] Sending /next (fallback)")
         await safe_send_message(bot_entity, '/next')
         last_cmd_time = time.time()
         await asyncio.sleep(4)
@@ -157,6 +164,47 @@ async def force_reset_state():
     async with state_lock:
         current_state = STATE_FINDING
 
+    return True
+
+
+async def force_reset_state():
+    """Force reset when completely stuck."""
+    global current_state
+
+    print("[!] FORCE RESET: Full recovery attempt...")
+
+    # Try multiple times with delays
+    for attempt in range(3):
+        print(f"[*] Reset attempt {attempt + 1}/3...")
+
+        # Try /stop
+        await safe_send_message(bot_entity, '/stop')
+        await asyncio.sleep(3)
+
+        # Check if we got out of chat
+        msgs = await client.get_messages(bot_entity, limit=5)
+        for m in msgs:
+            if m.text and ('not available' not in m.text.lower()):
+                # Check for menu or finding state
+                if m.reply_markup:
+                    for row in m.reply_markup.rows:
+                        for btn in row.buttons:
+                            if 'find' in (btn.text or '').lower():
+                                print("[✓] Reset successful - found menu")
+                                async with state_lock:
+                                    current_state = STATE_IDLE
+                                await click_find_partner()
+                                return True
+
+        await asyncio.sleep(2)
+
+    # Nuclear option: send /start to reset bot
+    print("[!] Nuclear reset: sending /start")
+    await safe_send_message(bot_entity, '/start')
+    await asyncio.sleep(4)
+    async with state_lock:
+        current_state = STATE_IDLE
+    await click_find_partner()
     return True
 
 
@@ -202,8 +250,8 @@ async def click_find_partner():
                     print(f"[*] State changed to match during search, aborting click")
                     return False
 
-            # Try clicking button first
-            if await click_any_button(['find a partner', 'find'], limit=15):
+            clicked, btn = await click_button_by_keywords(['find a partner', 'find partner'], limit=15)
+            if clicked:
                 print(f"[→] Find a Partner clicked (attempt {attempt+1})")
                 await asyncio.sleep(3)
                 return True
@@ -228,31 +276,6 @@ async def click_find_partner():
     return False
 
 
-async def click_next_or_find():
-    """After promo, try to click Next or Find a Partner button."""
-    global current_state
-
-    print("[*] Looking for Next or Find a Partner button...")
-
-    # Try buttons first
-    if await click_any_button(['next', 'find', 'find a partner'], limit=10):
-        async with state_lock:
-            current_state = STATE_FINDING
-        return True
-
-    # Fallback to /next with cooldown
-    now = time.time()
-    if now - last_cmd_time >= CMD_COOLDOWN:
-        await safe_send_message(bot_entity, '/next')
-        last_cmd_time = time.time()
-        await asyncio.sleep(3)
-        async with state_lock:
-            current_state = STATE_FINDING
-        return True
-
-    return False
-
-
 async def handle_match():
     global current_state
 
@@ -273,7 +296,7 @@ async def handle_match():
     except Exception as e:
         print(f"[!] Sticker error: {e}")
 
-    # Wait 3 seconds for partner to see sticker, then go next
+    # Wait 3 seconds for partner to see sticker
     print("[*] Waiting 3 seconds...")
     await asyncio.sleep(3)
 
@@ -284,11 +307,12 @@ async def handle_match():
         print(f"[*] State changed to {state} during wait, aborting")
         return
 
-    # Go to next partner
+    # PROPERLY end chat first, then find new partner
+    # Don't try to click "Find a Partner" while still in match!
     async with state_lock:
         current_state = STATE_IDLE
 
-    await click_next_or_find()
+    await end_chat_and_find_new()
 
 
 async def handle_finding_timeout():
@@ -330,7 +354,7 @@ async def stuck_watchdog():
             async with state_lock:
                 current_state = STATE_IDLE
 
-            await force_reset_state()
+            await end_chat_and_find_new()
     except Exception as e:
         print(f"[!] Stuck watchdog error: {e}")
 
@@ -362,13 +386,13 @@ async def handler(event):
 
     # ========== COMMAND NOT AVAILABLE IN CHAT ==========
     if 'This command is not available in chat' in text:
-        print("[!] Command not available in chat — stuck state detected!")
+        print("[!] Command not available in chat — still in match or stuck!")
 
         async with state_lock:
             current_state = STATE_STUCK
 
-        # Force reset with button clicks instead of command spam
-        await force_reset_state()
+        # We are still in a match. Must END chat first before finding new partner.
+        await end_chat_and_find_new()
         return
 
     # ========== PARTNER ENDED CHAT ==========
@@ -434,17 +458,17 @@ async def handler(event):
         state = current_state
 
     if state == STATE_MATCHED:
-        # Partner messaged before we sent sticker — still send sticker, then skip
+        # Partner messaged before we sent sticker
         print("[+] Partner sent message before our sticker!")
         return
 
     if state == STATE_PROMO_SENT:
-        # Partner messaged after sticker — go next
-        print("[+] Partner sent message after sticker, going next...")
+        # Partner messaged after sticker
+        print("[+] Partner sent message after sticker, ending chat...")
         async with state_lock:
             current_state = STATE_IDLE
         await asyncio.sleep(1)
-        await click_next_or_find()
+        await end_chat_and_find_new()
         return
 
 
