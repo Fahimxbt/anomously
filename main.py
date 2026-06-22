@@ -28,11 +28,13 @@ current_state = STATE_IDLE
 state_lock = asyncio.Lock()
 match_start_time = 0
 last_click_time = 0
+promo_sent_time = 0
 
 # Timeouts
 FINDING_TIMEOUT = 20
 MATCH_STUCK_TIMEOUT = 60
 RECOVERY_INTERVAL = 60
+PROMO_WAIT_TIME = 6  # Wait 6 seconds after sticker before /stop
 
 
 async def safe_send_message(entity, message, retries=3):
@@ -171,13 +173,14 @@ async def click_find_partner():
 
 
 async def handle_match():
-    global current_state
+    global current_state, promo_sent_time
 
     async with state_lock:
         if current_state != STATE_MATCHED:
             print(f"[*] Not in match (state={current_state}), aborting handle_match")
             return
         current_state = STATE_PROMO_SENT
+        promo_sent_time = time.time()
 
     print("[*] Forwarding sticker...")
     try:
@@ -190,16 +193,26 @@ async def handle_match():
     except Exception as e:
         print(f"[!] Sticker error: {e}")
 
-    # Wait 2 seconds
-    print("[*] Waiting 2 seconds...")
-    await asyncio.sleep(2)
+    # Wait for PROMO_WAIT_TIME seconds (6s), but check for early skip every 0.5s
+    print(f"[*] Waiting {PROMO_WAIT_TIME}s for partner to see sticker (checking for early skip)...")
+    waited = 0
+    check_interval = 0.5
+    while waited < PROMO_WAIT_TIME:
+        await asyncio.sleep(check_interval)
+        waited += check_interval
 
-    # CRITICAL: Re-check state before sending /stop
+        async with state_lock:
+            # If state changed (partner skipped or we got kicked), abort
+            if current_state != STATE_PROMO_SENT:
+                print(f"[*] State changed to {current_state} during promo wait (early skip detected after {waited:.1f}s)")
+                return
+
+    # After full wait, re-check state before sending /stop
     async with state_lock:
         state = current_state
 
     if state != STATE_PROMO_SENT:
-        print(f"[*] State changed to {state} during wait, aborting /stop")
+        print(f"[*] State changed to {state} after promo wait, aborting /stop")
         return
 
     # Send /stop to end chat
@@ -371,7 +384,7 @@ async def handler(event):
 
     if state == STATE_PROMO_SENT:
         # Partner messaged after sticker — they might have skipped
-        # Our /stop is already sent or will be sent, just wait
+        # Our /stop will be sent after the 6s wait, or early skip is detected by handle_match loop
         print("[+] Partner sent message after sticker")
         return
 
@@ -380,8 +393,8 @@ async def main():
     global bot_entity
     await client.start()
     print(f"[*] xbt1-bot (Anonymouslyrobot) started! BOT_ID={BOT_ID}")
-    print(f"[*] FINDING_TIMEOUT={FINDING_TIMEOUT}s | MATCH_STUCK_TIMEOUT={MATCH_STUCK_TIMEOUT}s")
-    print("[*] Flow: sticker → 2s → /stop → 3s → Find a Partner")
+    print(f"[*] FINDING_TIMEOUT={FINDING_TIMEOUT}s | MATCH_STUCK_TIMEOUT={MATCH_STUCK_TIMEOUT}s | PROMO_WAIT_TIME={PROMO_WAIT_TIME}s")
+    print("[*] Flow: sticker → 6s (with early skip detection) → /stop → 3s → Find a Partner")
     print("[*] Connected to Telegram successfully!")
 
     bot_entity = await client.get_entity('@Anonymouslyrobot')
