@@ -129,7 +129,7 @@ async def click_find_partner():
             return False
 
         now = time.time()
-        if now - last_click_time < 5:
+        if now - last_click_time < 7:
             print(f"[*] Click cooldown active ({now - last_click_time:.1f}s), skipping...")
             return False
         last_click_time = now
@@ -194,14 +194,15 @@ async def handle_match():
     print("[*] Waiting 2 seconds...")
     await asyncio.sleep(2)
 
+    # CRITICAL: Re-check state before sending /stop
     async with state_lock:
         state = current_state
 
     if state != STATE_PROMO_SENT:
-        print(f"[*] State changed to {state} during wait, aborting")
+        print(f"[*] State changed to {state} during wait, aborting /stop")
         return
 
-    # ALWAYS send /stop first to end chat, then find new partner
+    # Send /stop to end chat
     print("[→] Sending /stop to end chat...")
     await safe_send_message(bot_entity, '/stop')
 
@@ -244,6 +245,7 @@ async def stuck_watchdog():
         async with state_lock:
             state = current_state
 
+        # Check both MATCHED and PROMO_SENT states
         if state not in (STATE_MATCHED, STATE_PROMO_SENT):
             return
 
@@ -288,8 +290,16 @@ async def handler(event):
 
     # ========== COMMAND NOT AVAILABLE IN CHAT ==========
     if 'This command is not available in chat' in text:
-        print("[!] Command not available in chat — we are still in a match!")
-        # Just wait, the /stop we sent will eventually work or stuck watchdog will catch it
+        print("[!] Command not available in chat — forcing recovery...")
+
+        async with state_lock:
+            old_state = current_state
+            current_state = STATE_IDLE
+
+        print(f"[*] State was {old_state}, forced to idle. Sending /stop...")
+        await safe_send_message(bot_entity, '/stop')
+        await asyncio.sleep(3)
+        await click_find_partner()
         return
 
     # ========== PARTNER ENDED CHAT ==========
